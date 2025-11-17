@@ -141,6 +141,8 @@ def visualize_depth(
     return depth_color
 
 if __name__ == "__main__":
+
+
   B = calculate_baseline()
   disp_maps, depth_maps = calculate_disparity("seq_01")
   print(f"Computed {len(disp_maps)} disparity/depth maps for seq_01")

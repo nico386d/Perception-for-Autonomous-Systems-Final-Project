@@ -1,0 +1,17 @@
+from pathlib import Path
+
+
+CROP_WIDTH = 244
+CROP_HEIGHT = 244
+BATCH_SIZE = 16
+EPOCHS = 5
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-4
+MAX_TRAIN_SAMPLES = 400
+MAX_VALIDATION_SAMPLES = 400
+RANDOM_SEED = 42
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = PROJECT_ROOT / "Data"
+RAW_ROOT = DATA_ROOT / "34759_final_project_raw"
+RECT_ROOT = DATA_ROOT / "34759_final_project_rect"
+VAL_SEQUENCES = ["seq_01", "seq_02"]

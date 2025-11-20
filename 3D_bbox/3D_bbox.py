@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from stereo_depth import calculate_disparity, calculate_baseline
+from stereo_depth import calculate_disparity, calculate_baseline, calculate_depth_depthpro
 import open3d as o3d
 
 
@@ -16,7 +16,7 @@ class bbox_3d:
     def depth(self):
 
         B = calculate_baseline()
-        disp_map, depth_map = calculate_disparity("seq_01")
+        depth_map = calculate_depth_depthpro("seq_01")
 
         depth_np = depth_map[0]    
 

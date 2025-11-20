@@ -7,7 +7,7 @@ import torch
 
 def get_path_weights():
     ROOT = Path(__file__).resolve().parent.parent.parent
-    weights_path = ROOT / "weights" / "Classification" / "best.pt"
+    weights_path = ROOT / "weights" / "Classification" / "best-x.pt"
     return Path(weights_path)
 
 def get_path_images():

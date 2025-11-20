@@ -31,10 +31,9 @@ def main():
     random.seed(42)
     random.shuffle(samples)
     train_samples = samples[:max_samples]  
-
-    project_root = Path(__file__).resolve().parent
-    raw_root  = project_root / "Data" / "34759_final_project_raw"
-    rect_root = project_root / "Data" / "34759_final_project_rect"
+    project_root = Path(__file__).resolve().parents[1]
+    raw_root  = project_root.parent  / "Data" / "34759_final_project_raw"
+    rect_root = project_root.parent  / "Data" / "34759_final_project_rect"
 
     val_seq1 = build_sequence_samples(raw_root, rect_root, "seq_01", camera="image_02")
     val_seq2 = build_sequence_samples(raw_root, rect_root, "seq_02", camera="image_02")

@@ -1,1 +1,0 @@
-This folder should contain the "34759_final_project_raw" and "34759_final_project_rect" folder

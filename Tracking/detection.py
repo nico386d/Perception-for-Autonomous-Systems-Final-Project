@@ -9,7 +9,7 @@ class Detection3D:
         # yaw: Orientation angle
         # dimensions: (width, height, length)
         # class_id: Object class (0=Car, 3=Pedestrian, 5=Cyclist)
-        # confidence: Detection confidence score *0, 1)
+        # confidence: Detection confidence score (0, 1)
         # frame_id: Optional frame number
         
         self.position = np.asarray(position, dtype=np.float64)

@@ -204,10 +204,11 @@ class bbox_3d:
                 print(f"[RANSAC] Skipping, only {num_pts} points left.")
                 break
 
+            # Increased settings for more thorough removal
             plane_model, inliers = outlier_cloud.segment_plane(
-                distance_threshold=0.25,
+                distance_threshold=0.30,
                 ransac_n=3,
-                num_iterations=400,
+                num_iterations=1000,
             )
 
             outlier_cloud = outlier_cloud.select_by_index(inliers, invert=True)
@@ -223,8 +224,9 @@ class bbox_3d:
         centroids: (N,3) array of desired centers in XYZ
         """
         object_clusters = []
+        valid_indices = []
 
-        for xyz_center in centroids:
+        for i, xyz_center in enumerate(centroids):
             k, idx, dist = pcd_tree.search_knn_vector_3d(xyz_center, max_points)
 
             if k == 0:
@@ -240,8 +242,9 @@ class bbox_3d:
 
             cluster = pcd.select_by_index(idx_prune)
             object_clusters.append(cluster)
+            valid_indices.append(i)
 
-        return object_clusters
+        return object_clusters, valid_indices
 
     # --------------------------------------------------------------
     # 7) full 3D cluster pipeline from XYZ + centers
@@ -262,23 +265,24 @@ class bbox_3d:
 
         if points.shape[0] < 3:
             print(f"[get_3d_clusters] Not enough valid 3D points: {points.shape[0]}")
-            return []  
+            return [], []
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
 
         downpcd = pcd.voxel_down_sample(voxel_size=0.15)
 
-        outlier_cloud = self.run_ransac(downpcd, n_iters=1)
+        # Increased iters to 3 for thorough road/sidewalk removal
+        outlier_cloud = self.run_ransac(downpcd, n_iters=3)
 
         if np.asarray(outlier_cloud.points).shape[0] < 3:
             print("[get_3d_clusters] Outlier cloud is too small after RANSAC.")
-            return []
+            return [], []
 
 
         pcd_cloud_tree = o3d.geometry.KDTreeFlann(outlier_cloud)
 
-        object_clusters = self.get_seeded_knn_clusters(
+        object_clusters, valid_indices = self.get_seeded_knn_clusters(
             outlier_cloud,
             pcd_cloud_tree,
             object_centers_xyz,
@@ -286,7 +290,7 @@ class bbox_3d:
             max_points=350,
         )
 
-        return object_clusters
+        return object_clusters, valid_indices
 
     # --------------------------------------------------------------
     # 8) XYZ -> (u,v) using projection matrix
@@ -366,25 +370,38 @@ class bbox_3d:
         return box_points_uv_list
 
     # --------------------------------------------------------------
-    # 11) Draw 3D boxes on image
+    # 11) Draw 3D boxes on image (With Anti-Overlap Logic)
     # --------------------------------------------------------------
-    def draw_3d_boxes(self, image, camera_box_points):
+    def draw_3d_boxes(self, image, camera_box_points, bboxes, valid_indices):
+        
+        # List to keep track of occupied label areas [x1, y1, x2, y2]
+        occupied_spaces = []
+        font_scale = 0.6
+        thickness = 1
+        padding = 5
+
         for i, box_pts in enumerate(camera_box_points):
             
             # box_pts: (2,8) -> transpose to ((u,v), ...)
             pts = [tuple(p) for p in box_pts.T]
             if len(pts) != 8:
                 continue
+                
+            original_idx = valid_indices[i]
+            conf = bboxes[original_idx, 4]
+            cls_id = int(bboxes[original_idx, 5])
+            
+            label_name = self.model.names[cls_id]
+            label_text = f"{label_name} {conf:.2f}"
 
             A, B, C, D, E, F, G, H = pts
             color = get_pastel(i)
 
-        
+            # Draw 3D Box Lines
             cv2.line(image, A, B, color, 2)
             cv2.line(image, B, D, color, 2)
             cv2.line(image, A, C, color, 2)
             cv2.line(image, D, C, color, 2)
-
 
             cv2.line(image, G, E, color, 2)
             cv2.line(image, H, F, color, 2)
@@ -395,6 +412,63 @@ class bbox_3d:
             cv2.line(image, G, C, color, 2)
             cv2.line(image, F, B, color, 2)
             cv2.line(image, H, D, color, 2)
+            
+            # --- Label Drawing with Anti-Overlap ---
+
+         
+            (w, h), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+            
+            
+            base_x = int(max(padding, min(image.shape[1] - w - padding, E[0])))
+            base_y = int(max(h + padding * 2, min(image.shape[0] - padding, E[1])))
+            
+        
+            box_x1 = base_x - padding
+            box_y1 = base_y - h - padding
+            box_x2 = base_x + w + padding
+            box_y2 = base_y + padding
+
+            # Collision detection loop
+            shifted_count = 0
+            max_shifts = 20 # Safety break to prevent infinite loops
+            overlaps = True
+
+            while overlaps and shifted_count < max_shifts:
+                overlaps = False
+                for occupied in occupied_spaces:
+                    ox1, oy1, ox2, oy2 = occupied
+                    if (box_x1 < ox2 and box_x2 > ox1 and
+                        box_y1 < oy2 and box_y2 > oy1):
+                        overlaps = True
+                        break 
+
+                if overlaps:
+                    shift_amount = h + (padding * 2) + 2 
+                    box_y1 -= shift_amount
+                    box_y2 -= shift_amount
+                    base_y -= shift_amount
+                    shifted_count += 1
+    
+            if box_y1 < 0:
+                 shift_back = abs(box_y1) + padding
+                 box_y1 += shift_back
+                 box_y2 += shift_back
+                 base_y += shift_back
+
+            cv2.rectangle(image, (box_x1, box_y1), (box_x2, box_y2), (0,0,0), -1)
+            
+            cv2.putText(
+                image, 
+                label_text, 
+                (base_x, base_y), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                font_scale, 
+                (255, 255, 255), 
+                thickness, 
+                cv2.LINE_AA
+            )
+       
+            occupied_spaces.append([box_x1, box_y1, box_x2, box_y2])
 
         return image
 
@@ -492,6 +566,7 @@ if __name__ == "__main__":
     left_image, left_disparity, depth_map, bboxes = bbox.get_depth_detections(
         left_image,
         right_image,
+        index,
         method="median",
         draw_boxes=False,
     )
@@ -509,11 +584,11 @@ if __name__ == "__main__":
 
     object_centers_xyz = bbox.get_xyz_centers(bboxes, xyz)
 
-    object_clusters_xyz = bbox.get_3d_clusters(xyz, object_centers_xyz)
+    object_clusters_xyz, valid_indices = bbox.get_3d_clusters(xyz, object_centers_xyz)
 
     box_points_uv = bbox.get_3d_bboxes(object_clusters_xyz)
   
-    left_with_3d = bbox.draw_3d_boxes(left_image.copy(), box_points_uv)
+    left_with_3d = bbox.draw_3d_boxes(left_image.copy(), box_points_uv, bboxes, valid_indices)
 
     new_image = np.zeros_like(left_image, dtype=np.uint8)
     new_image = bbox.draw_clusters_on_image(object_clusters_xyz, new_image)

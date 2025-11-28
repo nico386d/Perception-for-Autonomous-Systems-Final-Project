@@ -1,8 +1,6 @@
 import os
-from glob import glob
 import cv2
 import numpy as np
-import pandas as pd
 from matplotlib import cm
 import matplotlib.pyplot as plt
 
@@ -10,7 +8,6 @@ plt.rcParams["figure.figsize"] = (20, 10)
 
 from stereo_depth import calculate_disparity, calculate_baseline
 import open3d as o3d
-import torch
 from ultralytics import YOLO
 from pathlib import Path
 
@@ -27,7 +24,6 @@ def get_pastel(z):
     return [int(255 * val) for val in pastel(z)[:3]]
 
 # COCO class IDs for person, bicycle, car
-# 0: person, 1: bicycle, 2: car  (COCO / YOLO default) :contentReference[oaicite:2]{index=2}
 ALLOWED_CLASS_IDS = [0, 1, 2]
 
 
@@ -41,24 +37,33 @@ class bbox_3d:
         Q=None,
         num_disparities=None,
     ):
-
         self.K = camera_matrix
         self.P_left = projection_matrix
         self.Q = Q
         self.num_disparities = num_disparities
         self.model = model  # Ultralytics YOLO model
 
-    # --------------------------------------------------------------
-    # 1) Disparity + depth
-    # --------------------------------------------------------------
-    def depth_and_disp(self):
-        _ = calculate_baseline()
-        disp_map, depth_map = calculate_disparity("seq_01")
+        # cache disparity/depth for the whole sequence
+        self._disp_maps = None
+        self._depth_maps = None
 
-        depth_0 = np.asarray(depth_map[0])
-        disp_0 = np.asarray(disp_map[0])
+    # --------------------------------------------------------------
+    # 1) Disparity + depth (per frame)
+    # --------------------------------------------------------------
+    def _ensure_stereo(self):
+        if self._disp_maps is None or self._depth_maps is None:
+            _ = calculate_baseline()
+            self._disp_maps, self._depth_maps = calculate_disparity("seq_01")
 
-        return depth_0, disp_0
+    def depth_and_disp(self, frame_index: int):
+        """
+        Return disparity and depth for a given frame index.
+        All maps are computed once and cached.
+        """
+        self._ensure_stereo()
+        depth_i = np.asarray(self._depth_maps[frame_index])
+        disp_i = np.asarray(self._disp_maps[frame_index])
+        return depth_i, disp_i
 
     # --------------------------------------------------------------
     # 2) YOLO detections + depth, append (u, v, z) per box
@@ -69,6 +74,7 @@ class bbox_3d:
         right_image,
         method="median",
         draw_boxes=True,
+        frame_index=0,
     ):
         """
         Returns:
@@ -78,11 +84,10 @@ class bbox_3d:
             bboxes: [x1, y1, x2, y2, conf, cls, u, v, z]
         """
 
-        depth_map, disp_map = self.depth_and_disp()
+        depth_map, disp_map = self.depth_and_disp(frame_index)
         depth_map = np.nan_to_num(depth_map, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Filter detections at inference time to person/bicycle/car only
-        # using `classes` argument as per Ultralytics docs. :contentReference[oaicite:3]{index=3}
+        # Filter detections to person/bicycle/car only
         results = self.model(left_image, classes=ALLOWED_CLASS_IDS)
         detections = results[0]
 
@@ -91,10 +96,9 @@ class bbox_3d:
             bboxes = np.zeros((0, 9), dtype=float)
             return left_image, disp_map, depth_map, bboxes
 
-        # xyxy, confidence, class-id from Ultralytics Boxes object :contentReference[oaicite:4]{index=4}
         xyxy = boxes.xyxy.cpu().numpy()          # (N, 4)
         conf = boxes.conf.cpu().numpy().reshape(-1, 1)  # (N, 1)
-        cls = boxes.cls.cpu().numpy().reshape(-1, 1)    # (N, 1)
+        cls  = boxes.cls.cpu().numpy().reshape(-1, 1)   # (N, 1)
 
         # Base: [x1, y1, x2, y2, conf, cls]
         base_bboxes = np.concatenate([xyxy, conf, cls], axis=1)
@@ -108,30 +112,23 @@ class bbox_3d:
             x2i = int(min(depth_map.shape[1] - 1, np.ceil(x2)))
             y2i = int(min(depth_map.shape[0] - 1, np.ceil(y2)))
 
-            # 2D center in pixels
             u = 0.5 * (x1 + x2)
             v = 0.5 * (y1 + y2)
 
-            # depth stats inside bbox
             box_depth = depth_map[y1i:y2i + 1, x1i:x2i + 1].flatten()
             box_depth = box_depth[box_depth > 0]
 
             if len(box_depth) == 0:
                 z = 0.0
             else:
-                if method == "median":
-                    z = np.median(box_depth)
-                else:
-                    z = np.mean(box_depth)
+                z = np.median(box_depth) if method == "median" else np.mean(box_depth)
 
             uvz[i, :] = np.array([u, v, z])
 
         # Final: [x1, y1, x2, y2, conf, cls, u, v, z]
         bboxes = np.concatenate([base_bboxes, uvz], axis=1)
 
-        # Optionally draw only the filtered boxes with their labels
         if draw_boxes:
-            # We'll draw manually instead of detections.plot() so we stay consistent
             img_to_draw = left_image.copy()
             names = getattr(self.model, "names", {})
             for row in bboxes:
@@ -166,31 +163,6 @@ class bbox_3d:
             raise ValueError("Q matrix is not set. Pass it into bbox_3d(Q=...).")
         xyz = cv2.reprojectImageTo3D(disp_map.copy(), self.Q)
         return xyz
-
-    def depth_to_pcd_o3d(depth_map, K):
-        # Not used in current pipeline, left as-is
-        h, w = depth_map.shape
-
-        intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width=w,
-            height=h,
-            fx=K[0, 0],
-            fy=K[1, 1],
-            cx=K[0, 2],
-            cy=K[1, 2],
-        )
-
-        depth_o3d = o3d.geometry.Image(depth_map.astype(np.float32))
-
-        pcd = o3d.geometry.PointCloud.create_from_depth_image(
-            depth_o3d,
-            intrinsic,
-            depth_scale=1.0,
-            depth_trunc=80.0,
-            stride=1,
-        )
-
-        return pcd
 
     # --------------------------------------------------------------
     # 4) get object centers in XYZ from bboxes and xyz map
@@ -229,12 +201,12 @@ class bbox_3d:
             roi_valid = roi_xyz[mask]
 
             if roi_valid.shape[0] == 0:
-                # leave as NaN -> this bbox will be skipped later
                 continue
 
             centers[i, :] = np.median(roi_valid, axis=0)
 
         return centers
+
     # --------------------------------------------------------------
     # 5) RANSAC plane removal
     # --------------------------------------------------------------
@@ -296,6 +268,7 @@ class bbox_3d:
             valid_indices.append(idx_seed)
 
         return object_clusters, np.array(valid_indices, dtype=int)
+
     # --------------------------------------------------------------
     # 7) full 3D cluster pipeline from XYZ + centers
     # --------------------------------------------------------------
@@ -338,7 +311,7 @@ class bbox_3d:
             outlier_cloud,
             pcd_cloud_tree,
             object_centers_xyz,
-            eps=1.5,  # must match above
+            eps=1.5,
             max_points=400,
         )
 
@@ -434,7 +407,6 @@ class bbox_3d:
 
         for i, box_pts in enumerate(camera_box_points):
 
-            # box_pts: (2,8) -> list of (u,v)
             pts = [tuple(p) for p in box_pts.T]
             if len(pts) != 8:
                 continue
@@ -465,7 +437,6 @@ class bbox_3d:
                 cls_name = names.get(cls_i, str(cls_i))
                 label = f"{cls_name} {conf_i:.2f}"
 
-                # Put text near the top-left of the projected 3D box
                 u_min = min(p[0] for p in pts)
                 v_min = min(p[1] for p in pts)
                 text_org = (int(u_min), int(max(0, v_min - 10)))
@@ -509,7 +480,6 @@ def get_path_images(seq_name: str):
 # ------------------------------------------------------------------
 if __name__ == "__main__":
 
-    # YOLO11n pretrained on COCO, as per Ultralytics docs :contentReference[oaicite:5]{index=5}
     model = YOLO("yolo11n.pt")
 
     P_rect_02 = np.array([
@@ -556,7 +526,7 @@ if __name__ == "__main__":
         [0.0, 0.0, 1.0, 0.0]
     ], dtype=np.float32)
 
-    NUM_DISPARITIES = None  # e.g. 64 if you want cropping, else None
+    NUM_DISPARITIES = None
 
     bbox = bbox_3d(
         model,
@@ -567,56 +537,53 @@ if __name__ == "__main__":
     )
 
     left_imgs, right_imgs = get_path_images("seq_01")
-    index = 2
 
-    left_image = cv2.cvtColor(cv2.imread(str(left_imgs[index])), cv2.COLOR_BGR2RGB)
-    right_image = cv2.cvtColor(cv2.imread(str(right_imgs[index])), cv2.COLOR_BGR2RGB)
+    ROOT = Path(__file__).resolve().parent.parent
+    out_dir = ROOT / "outputs_3d_bbox" / "seq_01"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    left_image_det, left_disparity, depth_map, bboxes = bbox.get_depth_detections(
-        left_image,
-        right_image,
-        method="median",
-        draw_boxes=False,  # set True if you want 2D boxes drawn too
-    )
+    for index, (l_path, r_path) in enumerate(zip(left_imgs, right_imgs)):
+        print(f"Frame {index}/{len(left_imgs)-1}")
 
-    # if nothing detected, just show depth
-    if bboxes.shape[0] == 0:
-        print("No detections for allowed classes (person, bicycle, car).")
-        plt.imshow(left_image)
-        plt.axis("off")
-        plt.show()
-        raise SystemExit
+        left_image = cv2.cvtColor(cv2.imread(str(l_path)), cv2.COLOR_BGR2RGB)
+        right_image = cv2.cvtColor(cv2.imread(str(r_path)), cv2.COLOR_BGR2RGB)
 
-    # project disparity to 3D xyz
-    xyz = bbox.disparity_to_xyz(left_disparity)
+        left_image_det, left_disparity, depth_map, bboxes = bbox.get_depth_detections(
+            left_image,
+            right_image,
+            method="median",
+            draw_boxes=False,
+            frame_index=index,
+        )
 
-    object_centers_xyz = bbox.get_xyz_centers(bboxes, xyz)
+        if bboxes.shape[0] == 0:
+            print("  No detections (person/bicycle/car).")
+            continue
 
-    object_clusters_xyz, valid_indices = bbox.get_3d_clusters(xyz, object_centers_xyz)
+        xyz = bbox.disparity_to_xyz(left_disparity)
+        object_centers_xyz = bbox.get_xyz_centers(bboxes, xyz)
 
-    if len(object_clusters_xyz) == 0:
-        print("No 3D clusters found.")
-        plt.imshow(left_image)
-        plt.axis("off")
-        plt.show()
-        raise SystemExit
+        object_clusters_xyz, valid_indices = bbox.get_3d_clusters(xyz, object_centers_xyz)
 
-    # Keep only bboxes that produced a valid 3D cluster
-    bboxes_valid = bboxes[valid_indices]
+        if len(object_clusters_xyz) == 0:
+            print("  No 3D clusters found.")
+            continue
 
-    box_points_uv = bbox.get_3d_bboxes(object_clusters_xyz)
+        bboxes_valid = bboxes[valid_indices]
+        box_points_uv = bbox.get_3d_bboxes(object_clusters_xyz)
 
-    left_with_3d = bbox.draw_3d_boxes(
-        left_image_det.copy(),  # or left_image.copy() if you don't want 2D boxes
-        box_points_uv,
-        bboxes_for_boxes=bboxes_valid,
-    )
+        left_with_3d = bbox.draw_3d_boxes(
+            left_image_det.copy(),
+            box_points_uv,
+            bboxes_for_boxes=bboxes_valid,
+        )
 
-    new_image = np.zeros_like(left_image, dtype=np.uint8)
-    new_image = bbox.draw_clusters_on_image(object_clusters_xyz, new_image)
+        new_image = np.zeros_like(left_image, dtype=np.uint8)
+        new_image = bbox.draw_clusters_on_image(object_clusters_xyz, new_image)
 
-    stacked = np.vstack((left_with_3d, new_image))
-    plt.figure(figsize=(25, 25))
-    plt.imshow(stacked)
-    plt.axis("off")
-    plt.show()
+        stacked = np.vstack((left_with_3d, new_image))
+
+        out_path = out_dir / f"{index:06d}.png"
+        plt.imsave(out_path, stacked)
+
+    print("Done.")
